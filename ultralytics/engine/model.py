@@ -11,7 +11,7 @@ from PIL import Image
 from ultralytics.cfg import TASK2DATA, get_cfg, get_save_dir
 from ultralytics.engine.results import Results
 from ultralytics.hub import HUB_WEB_ROOT, HUBTrainingSession
-from ultralytics.nn.tasks import attempt_load_one_weight, guess_model_task, nn, yaml_model_load
+from ultralytics.nn.tasks import attempt_load_one_weight, guess_model_task, nn, yaml_model_load, ClassificationModel, DetectionModel, DetectionModel3D, OBBModel, PoseModel, SegmentationModel
 from ultralytics.utils import (
     ARGV,
     ASSETS,
@@ -24,6 +24,7 @@ from ultralytics.utils import (
     emojis,
     yaml_load,
 )
+from ultralytics.engine.trainer3d import DetectionTrainer3D
 
 
 class Model(nn.Module):
@@ -124,27 +125,58 @@ class Model(nn.Module):
         self.task = task  # task type
         model = str(model).strip()
 
-        # Check if Ultralytics HUB model from https://hub.ultralytics.com
-        if self.is_hub_model(model):
-            # Fetch model from HUB
-            checks.check_requirements("hub-sdk>=0.0.12")
-            session = HUBTrainingSession.create_session(model)
-            model = session.model_file
-            if session.train_args:  # training sent from HUB
-                self.session = session
-
-        # Check if Triton Server model
-        elif self.is_triton_model(model):
-            self.model_name = self.model = model
-            self.overrides["task"] = task or "detect"  # set `task=detect` if not explicitly set
-            return
-
+        # Initialize task and overrides before loading model
+        self.task = task or guess_model_task(model)
+        self.overrides = {
+            'model': model,
+            'task': self.task,
+            'mode': 'train',
+            'imgsz': 640,
+            'data': None,
+            'device': '',
+            'verbose': verbose,
+            'cfg': model if str(model).endswith('.yaml') else None,
+            'epochs': DEFAULT_CFG_DICT["epochs"],
+            'batch': DEFAULT_CFG_DICT["batch"],
+            'resume': False,
+            'exist_ok': False,
+            'pretrained': True,
+            'optimizer': 'auto',
+            'patience': 50,
+            'lr0': 0.01,
+            'lrf': 0.01,
+            'momentum': 0.937,
+            'weight_decay': 0.0005,
+            'warmup_epochs': 3.0,
+            'warmup_momentum': 0.8,
+            'warmup_bias_lr': 0.1,
+            'box': 7.5,
+            'cls': 0.5,
+            'dfl': 1.5,
+            'fl_gamma': 0.0,
+            'label_smoothing': 0.0,
+            'nbs': 64,
+            'overlap_mask': True,
+            'mask_ratio': 4,
+            'dropout': 0.0,
+            'val': True,
+            'save': True,
+            'save_period': -1,
+            'cache': False,
+            'close_mosaic': 10,
+            'amp': True,
+            'fraction': 1.0,
+            'profile': False,
+            'freeze': None,
+            'deterministic': True,
+            'seed': 42,
+        }
+        
         # Load or create new YOLO model
         if Path(model).suffix in {".yaml", ".yml"}:
-            self._new(model, task=task, verbose=verbose)
+            self._new(model, task=task)
         else:
             self._load(model, task=task)
-
         # Delete super().training for accessing self.model.training
         del self.training
 
@@ -261,43 +293,53 @@ class Model(nn.Module):
         self.model.task = self.task
         self.model_name = cfg
 
-    def _load(self, weights: str, task=None) -> None:
+    def _load(self, weights: str, task: str = None):
         """
-        Loads a model from a checkpoint file or initializes it from a weights file.
-
-        This method handles loading models from either .pt checkpoint files or other weight file formats. It sets
-        up the model, task, and related attributes based on the loaded weights.
-
+        Load a model from a weights file.
+        
         Args:
-            weights (str): Path to the model weights file to be loaded.
-            task (str | None): The task associated with the model. If None, it will be inferred from the model.
-
-        Raises:
-            FileNotFoundError: If the specified weights file does not exist or is inaccessible.
-            ValueError: If the weights file format is unsupported or invalid.
-
-        Examples:
-            >>> model = Model()
-            >>> model._load("yolo11n.pt")
-            >>> model._load("path/to/weights.pth", task="detect")
+            weights (str): Path to weights file.
+            task (str, optional): Task type. Defaults to None.
         """
-        if weights.lower().startswith(("https://", "http://", "rtsp://", "rtmp://", "tcp://")):
-            weights = checks.check_file(weights, download_dir=SETTINGS["weights_dir"])  # download and return local file
-        weights = checks.check_model_file_from_stem(weights)  # add suffix, i.e. yolov8n -> yolov8n.pt
-
-        if Path(weights).suffix == ".pt":
-            self.model, self.ckpt = attempt_load_one_weight(weights)
-            self.task = self.model.args["task"]
-            self.overrides = self.model.args = self._reset_ckpt_args(self.model.args)
-            self.ckpt_path = self.model.pt_path
+        suffix = Path(weights).suffix
+        if suffix == '.pt':
+            self._load_model(weights, task)
+        elif suffix in ('.yaml', '.yml'):
+            self._load_yaml(weights, task)
         else:
-            weights = checks.check_file(weights)  # runs in all cases, not redundant with above call
-            self.model, self.ckpt = weights, None
-            self.task = task or guess_model_task(weights)
-            self.ckpt_path = weights
-        self.overrides["model"] = weights
-        self.overrides["task"] = self.task
-        self.model_name = weights
+            LOGGER.warning(f'Unrecognized file type {suffix}. Attempting to load as .pt file.')
+            self._load_model(weights, task)
+
+    def _load_yaml(self, cfg: str, task: str = None):
+        """
+        Load a model from a YAML file.
+        
+        Args:
+            cfg (str): Path to YAML file.
+            task (str, optional): Task type. Defaults to None.
+        """
+        self.task = task or self.task
+        cfg_dict = yaml_model_load(cfg)
+        if not self.task:
+            self.task = guess_model_task(cfg)
+        self.model = self.task_map[self.task]['model'](cfg_dict, verbose=self.overrides.get('verbose', False))
+        self.model.task = self.task
+        self.model.names = cfg_dict.get('names', {i: f'class{i}' for i in range(cfg_dict.get('nc', 80))})
+        self.model.transforms = None
+
+    def _load_model(self, weights: str, task: str = None):
+        """
+        Load a model from a weights file.
+        
+        Args:
+            weights (str): Path to weights file.
+            task (str, optional): Task type. Defaults to None.
+        """
+        self.model = attempt_load_one_weight(weights, device='cpu')
+        self.task = task or guess_model_task(weights)
+        self.ckpt = torch.load(weights, map_location='cpu')
+        self.overrides = self.ckpt.get('train_args', {})
+        self.model.args = {k: v for k, v in self.overrides.items() if k in DEFAULT_CFG_DICT.keys()}
 
     def _check_is_pytorch_model(self) -> None:
         """
@@ -789,7 +831,7 @@ class Model(nn.Module):
         overrides = yaml_load(checks.check_yaml(kwargs["cfg"])) if kwargs.get("cfg") else self.overrides
         custom = {
             # NOTE: handle the case when 'cfg' includes 'data'.
-            "data": overrides.get("data") or DEFAULT_CFG_DICT["data"] or TASK2DATA[self.task],
+            "data": overrides.get("data") or DEFAULT_CFG_DICT["data"] or TASK2DATA["detect3d"],
             "model": self.overrides["model"],
             "task": self.task,
         }  # method defaults
@@ -1101,35 +1143,57 @@ class Model(nn.Module):
             ) from e
 
     @property
-    def task_map(self) -> dict:
-        """
-        Provides a mapping from model tasks to corresponding classes for different modes.
+    def task_map(self):
+        """Map head to model, trainer, validator, and predictor classes."""
+        from ultralytics import YOLO
+        from ultralytics.models import RTDETR, SAM
+        from ultralytics.models.fastsam import FastSAM
+        from ultralytics.models.nas import NAS
+        from ultralytics.utils import DEFAULT_CFG
+        from ultralytics.nn.tasks import ClassificationModel, DetectionModel, DetectionModel3D, OBBModel, PoseModel, SegmentationModel
+        from ultralytics.nn.tasks import ClassificationTrainer, DetectionTrainer, DetectionTrainer3D, OBBTrainer, PoseTrainer, SegmentationTrainer
+        from ultralytics.nn.tasks import ClassificationValidator, DetectionValidator, DetectionValidator3D, OBBValidator, PoseValidator, SegmentationValidator
+        from ultralytics.nn.tasks import ClassificationPredictor, DetectionPredictor, DetectionPredictor3D, OBBPredictor, PosePredictor, SegmentationPredictor
 
-        This property method returns a dictionary that maps each supported task (e.g., detect, segment, classify)
-        to a nested dictionary. The nested dictionary contains mappings for different operational modes
-        (model, trainer, validator, predictor) to their respective class implementations.
-
-        The mapping allows for dynamic loading of appropriate classes based on the model's task and the
-        desired operational mode. This facilitates a flexible and extensible architecture for handling
-        various tasks and modes within the Ultralytics framework.
-
-        Returns:
-            (Dict[str, Dict[str, Any]]): A dictionary where keys are task names (str) and values are
-            nested dictionaries. Each nested dictionary has keys 'model', 'trainer', 'validator', and
-            'predictor', mapping to their respective class implementations.
-
-        Examples:
-            >>> model = Model()
-            >>> task_map = model.task_map
-            >>> detect_class_map = task_map["detect"]
-            >>> segment_class_map = task_map["segment"]
-
-        Note:
-            The actual implementation of this method may vary depending on the specific tasks and
-            classes supported by the Ultralytics framework. The docstring provides a general
-            description of the expected behavior and structure.
-        """
-        raise NotImplementedError("Please provide task map for your model!")
+        task_map = {
+            'detect': {
+                'model': DetectionModel,
+                'trainer': DetectionTrainer,
+                'validator': DetectionValidator,
+                'predictor': DetectionPredictor,
+            },
+            'detect3d': {
+                'model': DetectionModel3D,
+                'trainer': DetectionTrainer3D,
+                'validator': DetectionValidator,
+                'predictor': DetectionPredictor,
+            },
+            'segment': {
+                'model': SegmentationModel,
+                'trainer': SegmentationTrainer,
+                'validator': SegmentationValidator,
+                'predictor': SegmentationPredictor,
+            },
+            'classify': {
+                'model': ClassificationModel,
+                'trainer': ClassificationTrainer,
+                'validator': ClassificationValidator,
+                'predictor': ClassificationPredictor,
+            },
+            'pose': {
+                'model': PoseModel,
+                'trainer': PoseTrainer,
+                'validator': PoseValidator,
+                'predictor': PosePredictor,
+            },
+            'obb': {
+                'model': OBBModel,
+                'trainer': OBBTrainer,
+                'validator': OBBValidator,
+                'predictor': OBBPredictor,
+            },
+        }
+        return task_map
 
     def eval(self):
         """

@@ -1,0 +1,12 @@
+# YOLOv11n 3D model
+inherits: yolo11-3d-base.yaml  # inherit from base configuration
+
+# Parameters
+scale: n  # model scale (n:nano)
+scales:
+  # [depth_multiple, width_multiple, max_channels]
+  n: [0.33, 0.25, 1024]  # YOLOv11n parameters
+  s: [0.33, 0.50, 1024]  # YOLOv11s parameters
+  m: [0.67, 0.75, 768]   # YOLOv11m parameters
+  l: [1.00, 1.00, 512]   # YOLOv11l parameters
+  x: [1.33, 1.25, 512]   # YOLOv11x parameters 

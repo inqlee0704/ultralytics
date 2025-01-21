@@ -16,6 +16,7 @@ Example:
     os.system(f"onnxslim {f} {f} && open {f}")  # pip install onnxslim
     ```
 """
+from .block3d import *
 
 from .block import (
     C1,
@@ -87,21 +88,28 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .conv3d import *
+from .head3d import *
 
 __all__ = (
     "Conv",
     "Conv2",
+    "Conv3d",
     "LightConv",
     "RepConv",
     "DWConv",
+    "DWConv3d",
     "DWConvTranspose2d",
     "ConvTranspose",
+    "Conv3dTranspose",
     "Focus",
+    "Focus3d",
     "GhostConv",
     "ChannelAttention",
     "SpatialAttention",
     "CBAM",
     "Concat",
+    "Concat3d",
     "TransformerLayer",
     "TransformerBlock",
     "MLPBlock",
@@ -111,11 +119,13 @@ __all__ = (
     "HGStem",
     "SPP",
     "SPPF",
+    "SPPF3d",
     "C1",
     "C2",
     "C3",
     "C2f",
     "C3k2",
+    "C3k2_3d",
     "SCDown",
     "C2fPSA",
     "C2PSA",
@@ -160,4 +170,4 @@ __all__ = (
     "PSA",
     "TorchVision",
     "Index",
-)
+) 

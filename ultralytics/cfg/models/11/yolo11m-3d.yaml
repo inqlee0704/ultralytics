@@ -1,0 +1,9 @@
+# YOLOv11m 3D model
+inherits: yolo11-3d.yaml
+
+# Parameters
+depth_multiple: 0.67  # model depth multiple
+width_multiple: 0.75  # layer channel multiple
+scales:
+  # [depth, width, max_channels]
+  m: [0.67, 0.75, 768]  # YOLOv11m-3D 

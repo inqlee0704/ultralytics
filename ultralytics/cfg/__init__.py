@@ -48,9 +48,10 @@ SOLUTION_MAP = {
 
 # Define valid tasks and modes
 MODES = {"train", "val", "predict", "export", "track", "benchmark"}
-TASKS = {"detect", "segment", "classify", "pose", "obb"}
+TASKS = {"detect", "detect3d", "segment", "classify", "pose", "obb"}
 TASK2DATA = {
     "detect": "coco8.yaml",
+    "detect3d": "coco8-3d.yaml",
     "segment": "coco8-seg.yaml",
     "classify": "imagenet10",
     "pose": "coco8-pose.yaml",
@@ -58,6 +59,7 @@ TASK2DATA = {
 }
 TASK2MODEL = {
     "detect": "yolo11n.pt",
+    "detect3d": "yolo11n-3d.pt",
     "segment": "yolo11n-seg.pt",
     "classify": "yolo11n-cls.pt",
     "pose": "yolo11n-pose.pt",
@@ -289,12 +291,13 @@ def get_cfg(cfg: Union[str, Path, Dict, SimpleNamespace] = DEFAULT_CFG_DICT, ove
         - The function performs type and value checks on the configuration data.
     """
     cfg = cfg2dict(cfg)
+    cfg = overrides
 
     # Merge overrides
     if overrides:
         overrides = cfg2dict(overrides)
-        if "save_dir" not in cfg:
-            overrides.pop("save_dir", None)  # special override keys to ignore
+        # if "save_dir" not in cfg:
+        overrides.pop("save_dir", None)  # special override keys to ignore
         check_dict_alignment(cfg, overrides)
         cfg = {**cfg, **overrides}  # merge cfg and overrides dicts (prefer overrides)
 
