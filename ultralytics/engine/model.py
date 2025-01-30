@@ -24,7 +24,7 @@ from ultralytics.utils import (
     emojis,
     yaml_load,
 )
-from ultralytics.engine.trainer3d import DetectionTrainer3D
+# from ultralytics.engine.trainer3d import DetectionTrainer3D
 
 
 class Model(nn.Module):

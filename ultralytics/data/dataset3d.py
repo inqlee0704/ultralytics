@@ -7,89 +7,121 @@ from pathlib import Path
 from torch.utils.data import Dataset
 from ..utils import LOGGER, TQDM
 
-class LoadVolumetricData(Dataset):
-    """YOLOv8 3D Dataset for volumetric data."""
-    
-    def __init__(self, path, imgsz=640, cache=False):
-        """Initialize 3D Dataset."""
-        super().__init__()
-        self.path = Path(path)
-        self.imgsz = imgsz
+class Dataset3D(Dataset):
+    """Custom Dataset for 3D YOLO training."""
+    def __init__(self, data_dir, split='train', transform=None, cache=False):
+        """Initialize Dataset3D."""
+        self.data_dir = Path(data_dir)
+        self.split = split
+        self.transforms = transform
         self.cache = cache
         self.data = []
         self.labels = []
         
-        # Load data paths and labels
-        self.volume_files = sorted([x for x in self.path.rglob('*.npy') if x.is_file()])  # adjust extension as needed
-        self.label_files = [x.with_suffix('.txt') for x in self.volume_files]
+        # Get volume files
+        self.volume_files = list(self.data_dir.glob('**/*.npy'))
+        if not self.volume_files:
+            raise FileNotFoundError(f'No volume files found in {self.data_dir}')
         
-        # Cache data
-        if cache:
-            self.cache_data()
+        # Get labels
+        self.labels_info = self.get_labels()
+        
+        # Cache data if requested
+        if self.cache:
+            self.cache_labels()
             
-    def cache_data(self):
-        """Cache dataset for faster training."""
-        LOGGER.info(f'Caching {len(self.volume_files)} 3D volumes...')
+        LOGGER.info(f'Found {len(self.volume_files)} volume files in {self.data_dir}')
+
+    def cache_labels(self):
+        """Cache dataset labels for faster training."""
+        LOGGER.info(f'Caching {len(self.volume_files)} volumes and labels...')
         self.data = []
         self.labels = []
-        for f in TQDM(self.volume_files):
-            volume = np.load(f)  # load 3D volume
+        for volume_path, label_info in TQDM(zip(self.volume_files, self.labels_info), desc="Caching..."):
+            volume = np.load(volume_path)
             self.data.append(torch.from_numpy(volume))
+            self.labels.append(label_info)
+
+    def get_labels(self):
+        """Returns dictionary of labels for training."""
+        labels = []
+        for volume_path in self.volume_files:
+            label_path = Path(str(volume_path).replace("/volumes/", "/labels/")).with_suffix('.txt')
             
-            # Load labels (x, y, z, d, h, w, class)
-            label_file = f.with_suffix('.txt')
-            if label_file.exists():
-                labels = np.loadtxt(label_file)
-                labels = torch.from_numpy(labels)
+            if label_path.exists():
+                # Load and parse labels
+                with open(label_path) as f:
+                    bboxes = []
+                    for line in f:
+                        # Parse label format: class x y z width height depth
+                        values = list(map(float, line.strip().split()))
+                        bboxes.append(values)
+                    bboxes = np.array(bboxes)
             else:
-                labels = torch.zeros((0, 7))
-            self.labels.append(labels)
-            
+                bboxes = np.zeros((0, 7))  # Empty array with correct shape
+            if len(bboxes) == 0:
+                bboxes = np.zeros((0, 7))  # Empty array with correct shape
+
+                
+            labels.append({
+                'im_file': str(volume_path),
+                'volume_file': str(volume_path),
+                'label_file': str(label_path),
+                'cls': bboxes[:, 0:1],  # n, 1
+                'bboxes': bboxes[:, 1:],  # n, 6 (x,y,z,w,h,d)
+                'normalized': True,
+                'bbox_format': 'xyzwhd',
+            })
+        return labels
+
     def __len__(self):
         """Return the total number of samples."""
         return len(self.volume_files)
-    
-    def __getitem__(self, index):
-        """Get a sample and its labels."""
+
+    def __getitem__(self, idx):
+        """Get a sample from the dataset."""
         if self.cache:
-            volume = self.data[index]
-            labels = self.labels[index]
+            volume = self.data[idx]
+            label_info = self.labels[idx]
         else:
-            volume_path = self.volume_files[index]
+            volume_path = self.volume_files[idx]
             volume = torch.from_numpy(np.load(volume_path))
+            label_info = self.labels_info[idx]
             
-            label_path = self.label_files[index]
-            if label_path.exists():
-                labels = torch.from_numpy(np.loadtxt(label_path))
-            else:
-                labels = torch.zeros((0, 7))
-                
-        # Preprocessing
-        volume = self.preprocess_volume(volume)
-        labels = self.preprocess_labels(labels)
-        
-        return volume, labels
-    
-    def preprocess_volume(self, volume):
-        """Preprocess 3D volume."""
-        # Normalize
-        volume = volume.float() / 255.0
-        
-        # Resize if needed
-        if volume.shape[1:] != (self.imgsz, self.imgsz, self.imgsz):
-            volume = torch.nn.functional.interpolate(
-                volume.unsqueeze(0),
-                size=(self.imgsz, self.imgsz, self.imgsz),
-                mode='trilinear',
-                align_corners=False
-            ).squeeze(0)
+        # Combine cls and bboxes for the final labels
+        if len(label_info['cls']):
+            labels = np.concatenate([label_info['cls'], label_info['bboxes']], axis=1)
+        else:
+            labels = np.zeros((0, 7))  # Empty array with correct shape
             
-        return volume
-    
-    def preprocess_labels(self, labels):
-        """Preprocess labels."""
-        # Convert absolute coordinates to relative
-        if len(labels):
-            labels[:, [0, 1, 2]] = labels[:, [0, 1, 2]] / self.imgsz
-            labels[:, [3, 4, 5]] = labels[:, [3, 4, 5]] / self.imgsz
-        return labels 
+        # Apply transforms if any
+        if self.transforms:
+            volume, labels = self.transforms(volume, labels)
+            
+        return {
+            'img': volume,  # Using 'img' key to maintain compatibility with YOLOv8
+            'cls': torch.from_numpy(labels[:, 0:1]) if len(labels) else torch.zeros((0, 1)),
+            'bboxes': torch.from_numpy(labels[:, 1:]) if len(labels) else torch.zeros((0, 6)),
+            'path': label_info['volume_file'],
+            'batch_idx': torch.zeros(len(labels)) if len(labels) else torch.zeros(0),
+            'ori_shape': volume.shape
+        }
+
+    @staticmethod
+    def collate_fn(batch):
+        """Collates data samples into batches."""
+        new_batch = {}
+        keys = batch[0].keys()
+        values = list(zip(*[list(b.values()) for b in batch]))
+        for i, k in enumerate(keys):
+            value = values[i]
+            if k == "img":
+                value = torch.stack(value, 0)
+            if k in {"bboxes", "cls"}:
+                value = torch.cat(value, 0)
+            new_batch[k] = value
+        new_batch["batch_idx"] = list(new_batch["batch_idx"])
+        for i in range(len(new_batch["batch_idx"])):
+            new_batch["batch_idx"][i] += i
+        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        return new_batch

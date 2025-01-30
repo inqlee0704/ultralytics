@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision
 
 from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import batch_probiou
@@ -637,7 +638,7 @@ def resample_segments(segments, n=1000):
         x = np.insert(x, np.searchsorted(x, xp), xp) if len(s) < n else x
         segments[i] = (
             np.concatenate([np.interp(x, xp, s[:, i]) for i in range(2)], dtype=np.float32).reshape(2, -1).T
-        )  # segment xy
+        )
     return segments
 
 
@@ -852,3 +853,308 @@ def empty_like(x):
     return (
         torch.empty_like(x, dtype=torch.float32) if isinstance(x, torch.Tensor) else np.empty_like(x, dtype=np.float32)
     )
+
+
+def non_max_suppression_3d(
+    prediction,
+    conf_thres=0.25,
+    iou_thres=0.45,
+    classes=None,
+    agnostic=False,
+    multi_label=False,
+    labels=(),
+    max_det=300,
+    nc=0,  # number of classes (optional)
+    max_time_img=0.05,
+    max_nms=30000,
+    max_wh=7680,
+):
+    """
+    Perform non-maximum suppression (NMS) on a set of 3D boxes.
+
+    Args:
+        prediction (torch.Tensor): Predictions tensor of shape (batch_size, num_boxes, num_classes + 7)
+                                 where 7 represents (x, y, z, w, h, d, conf).
+        conf_thres (float): Confidence threshold for filtering predictions.
+        iou_thres (float): IoU threshold for NMS.
+        classes (list, optional): Filter by class, i.e. (0, 1, 2).
+        agnostic (bool): Perform class-agnostic NMS.
+        multi_label (bool): Allow multiple labels per box.
+        labels (tuple): Use pre-computed labels if provided.
+        max_det (int): Maximum number of detections per image.
+        nc (int, optional): Number of classes.
+        max_time_img (float): Maximum time per image.
+        max_nms (int): Maximum number of boxes into NMS.
+        max_wh (float): Maximum box width and height.
+
+    Returns:
+        (list): List of detections, on (n,7) tensor per image [x, y, z, w, h, d, conf, cls].
+    """
+    if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
+        prediction = prediction[0]  # select only inference output
+    bs = prediction.shape[0]  # batch size
+    nc = nc or (prediction.shape[1] - 6)  # number of classes
+    nm = prediction.shape[1] - nc -6  # number of masks
+    # xc = prediction[..., 6] > conf_thres  # candidates
+    mi = 6+nc
+    xc = prediction[:, 6:mi].amax(1) > conf_thres 
+
+    # Settings
+    time_limit = 0.5 + max_time_img * bs  # seconds to quit after
+    redundant = True  # require redundant detections
+    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
+
+    prediction = prediction.transpose(-1, -2)  # shape(1,84,6300) to shape(1,6300,84)
+    t = time.time()
+    output = [torch.zeros((0, 8), device=prediction.device)] * bs
+
+    for xi, x in enumerate(prediction):  # image index, image inference
+        # Apply constraints
+        # x = x.transpose(0, 1)[xc[xi]]  # confidence
+        x = x[xc[xi]]  # confidence
+
+        # If none remain process next image
+        if not x.shape[0]:
+            continue
+
+        # Detections matrix nx7 (x, y, z, w, h, d, conf, cls)
+        # box, cls, mask = x[:, :6], x[:, 7:-1], x[:, -1:]
+        # Detections matrix nx6 (xyxy, conf, cls)
+        box, cls, mask = x.split((6, nc, nm), 1)
+        if multi_label:
+            i, j = (cls > conf_thres).nonzero(as_tuple=False).T
+            x = torch.cat((box[i], x[i, 6:7], j[:, None].float(), mask[i]), 1)
+        else:  # best class only
+            conf, j = cls.max(1, keepdim=True)
+            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
+
+        # Filter by class
+        if classes is not None:
+            x = x[(x[:, 7:8] == torch.tensor(classes, device=x.device)).any(1)]
+
+        # Check shape
+        n = x.shape[0]  # number of boxes
+        if not n:  # no boxes
+            continue
+        if n > max_nms:  # excess boxes
+            x = x[x[:, 6].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess boxes
+
+        # Batched NMS
+        c = x[:, 7:8] * (0 if agnostic else max_wh)  # classes
+        boxes, scores = x[:, :6] + c, x[:, 6]  # boxes (offset by class), scores
+        # i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
+        i = nms_3d(boxes, scores, iou_thres)  # NMS
+        i = i[:max_det]  # limit detections
+
+        output[xi] = x[i]
+        # if (time.time() - t) > time_limit:
+        #     LOGGER.warning(f'WARNING ⚠️ NMS time limit {time_limit:.3f}s exceeded')
+        #     break  # time limit exceeded
+
+    return output
+
+
+def xyzwhd2xyzxyz(x):
+    """
+    Convert bounding box coordinates from (x, y, z, width, height, depth) format to (x1, y1, z1, x2, y2, z2) format where
+    (x1, y1, z1) is the minimum point and (x2, y2, z2) is the maximum point.
+
+    Args:
+        x (np.ndarray | torch.Tensor): The input bounding box coordinates in (x, y, z, width, height, depth) format.
+
+    Returns:
+        y (np.ndarray | torch.Tensor): The bounding box coordinates in (x1, y1, z1, x2, y2, z2) format.
+    """
+    assert x.shape[-1] == 6, f"input shape last dimension expected 6 but input shape is {x.shape}"
+    y = empty_like(x)  # faster than clone/copy
+    xyz = x[..., :3]  # centers
+    whd = x[..., 3:] / 2  # half width-height-depth
+    y[..., :3] = xyz - whd  # min point (x1,y1,z1)
+    y[..., 3:] = xyz + whd  # max point (x2,y2,z2)
+    return y
+
+
+def xyzxyz2xyzwhd(x):
+    """
+    Convert bounding box coordinates from (x1, y1, z1, x2, y2, z2) format to (x, y, z, width, height, depth) format
+    where (x1, y1, z1) is the minimum point and (x2, y2, z2) is the maximum point.
+
+    Args:
+        x (np.ndarray | torch.Tensor): The input bounding box coordinates in (x1, y1, z1, x2, y2, z2) format.
+
+    Returns:
+        y (np.ndarray | torch.Tensor): The bounding box coordinates in (x, y, z, width, height, depth) format.
+    """
+    assert x.shape[-1] == 6, f"input shape last dimension expected 6 but input shape is {x.shape}"
+    y = empty_like(x)  # faster than clone/copy
+    y[..., 0] = (x[..., 0] + x[..., 3]) / 2  # x center
+    y[..., 1] = (x[..., 1] + x[..., 4]) / 2  # y center
+    y[..., 2] = (x[..., 2] + x[..., 5]) / 2  # z center
+    y[..., 3] = x[..., 3] - x[..., 0]  # width
+    y[..., 4] = x[..., 4] - x[..., 1]  # height
+    y[..., 5] = x[..., 5] - x[..., 2]  # depth
+    return y
+
+def compute_iou_3d(box1, boxes):
+    """
+    Compute the IoU of `box1` with each of the boxes in `boxes`.
+
+    Parameters:
+        box1 (Tensor): shape (6,) -> [x1, y1, z1, x2, y2, z2]
+        boxes (Tensor): shape (N, 6) -> each [x1, y1, z1, x2, y2, z2]
+
+    Returns:
+        Tensor: shape (N,) with the IoU of `box1` with each box in `boxes`.
+    """
+
+    # box1 dimensions
+    x1, y1, z1, x2, y2, z2 = box1
+
+    # boxes dimensions
+    xx1, yy1, zz1 = boxes[:, 0], boxes[:, 1], boxes[:, 2]
+    xx2, yy2, zz2 = boxes[:, 3], boxes[:, 4], boxes[:, 5]
+
+    # Calculate intersection boundaries
+    inter_x1 = torch.max(x1, xx1)
+    inter_y1 = torch.max(y1, yy1)
+    inter_z1 = torch.max(z1, zz1)
+
+    inter_x2 = torch.min(x2, xx2)
+    inter_y2 = torch.min(y2, yy2)
+    inter_z2 = torch.min(z2, zz2)
+
+    # Intersection dimensions
+    inter_dx = torch.clamp(inter_x2 - inter_x1, min=0)
+    inter_dy = torch.clamp(inter_y2 - inter_y1, min=0)
+    inter_dz = torch.clamp(inter_z2 - inter_z1, min=0)
+
+    # Intersection volume
+    intersection = inter_dx * inter_dy * inter_dz
+
+    # Volumes of boxes
+    box1_volume = (x2 - x1) * (y2 - y1) * (z2 - z1)
+    boxes_volume = (xx2 - xx1) * (yy2 - yy1) * (zz2 - zz1)
+
+    # Union volume
+    union = box1_volume + boxes_volume - intersection
+    union = torch.clamp(union, min=1e-6)  # for numerical stability
+
+    # IoU
+    iou = intersection / union
+    return iou
+
+
+def nms_3d(boxes, scores, iou_threshold):
+    """
+    Perform Non-Maximum Suppression on 3D bounding boxes.
+
+    Parameters:
+        boxes (Tensor): shape (N, 6) -> [x1, y1, z1, x2, y2, z2]
+        scores (Tensor): shape (N,)
+        iou_threshold (float): IoU threshold to determine overlap
+
+    Returns:
+        keep (Tensor): indices of boxes that are kept
+    """
+
+    if boxes.numel() == 0:
+        return torch.empty((0,), dtype=torch.long)
+
+    # Sort by scores in descending order
+    sorted_indices = torch.argsort(scores, descending=True)
+    boxes = boxes[sorted_indices]
+    scores = scores[sorted_indices]
+
+    keep = []
+    while boxes.size(0) > 0:
+        # Take the box with the highest score
+        curr_box = boxes[0]
+        curr_idx = sorted_indices[0]  # original index
+
+        keep.append(curr_idx.item())
+
+        if boxes.size(0) == 1:
+            break
+
+        # Compute IoU of the current box with the rest
+        rest_boxes = boxes[1:]
+        ious = compute_iou_3d(curr_box, rest_boxes)
+
+        # Keep only boxes with IoU <= threshold
+        mask = ious <= iou_threshold
+
+        # Update 'boxes' and 'sorted_indices'
+        boxes = rest_boxes[mask]
+        sorted_indices = sorted_indices[1:][mask]
+
+    return torch.tensor(keep, dtype=torch.long)
+
+
+def clip_boxes_3d(boxes, shape):
+    """
+    Takes a list of 3D bounding boxes and a shape (depth, height, width) and clips the bounding boxes to the shape.
+
+    Args:
+        boxes (torch.Tensor): The 3D bounding boxes to clip with shape (..., 6) in (x1, y1, z1, x2, y2, z2) format
+        shape (tuple): The shape of the volume as (depth, height, width)
+
+    Returns:
+        (torch.Tensor | numpy.ndarray): The clipped boxes.
+    """
+    if isinstance(boxes, torch.Tensor):  # faster individually
+        boxes[..., 0] = boxes[..., 0].clamp(0, shape[2])  # x1
+        boxes[..., 1] = boxes[..., 1].clamp(0, shape[1])  # y1
+        boxes[..., 2] = boxes[..., 2].clamp(0, shape[0])  # z1
+        boxes[..., 3] = boxes[..., 3].clamp(0, shape[2])  # x2
+        boxes[..., 4] = boxes[..., 4].clamp(0, shape[1])  # y2
+        boxes[..., 5] = boxes[..., 5].clamp(0, shape[0])  # z2
+    else:  # np.array (faster grouped)
+        boxes[..., [0, 3]] = boxes[..., [0, 3]].clip(0, shape[2])  # x1, x2
+        boxes[..., [1, 4]] = boxes[..., [1, 4]].clip(0, shape[1])  # y1, y2
+        boxes[..., [2, 5]] = boxes[..., [2, 5]].clip(0, shape[0])  # z1, z2
+    return boxes
+
+
+def scale_boxes_3d(img1_shape, boxes, img0_shape, ratio_pad=None, padding=True, xyzwhd=False):
+    """
+    Rescale 3D bounding boxes (in the format of xyzxyz by default) from the shape of the image they were originally
+    specified in (img1_shape) to the shape of a different image (img0_shape).
+
+    Args:
+        img1_shape (tuple): The shape of the image that the bounding boxes are for, in (depth, height, width).
+        boxes (torch.Tensor): The 3D bounding boxes to scale with shape (..., 6).
+        img0_shape (tuple): The shape of the target image in (depth, height, width).
+        ratio_pad (tuple): A tuple of (ratio, pad) for scaling the boxes. If not provided, the ratio and pad will be
+            calculated based on the size difference between the two images.
+        padding (bool): If True, assuming the boxes is based on image augmented by yolo style. If False then do regular
+            rescaling.
+        xyzwhd (bool): If True, the box format is (x, y, z, width, height, depth). Default is False (x1, y1, z1, x2, y2, z2).
+
+    Returns:
+        boxes (torch.Tensor): The scaled 3D bounding boxes.
+    """
+    if ratio_pad is None:  # calculate from img0_shape
+        # gain = old / new
+        gain = min(img1_shape[0] / img0_shape[0],  # depth
+                  img1_shape[1] / img0_shape[1],  # height
+                  img1_shape[2] / img0_shape[2])   # width
+        
+        # Calculate padding for each dimension
+        pad = ((img1_shape[2] - img0_shape[2] * gain) / 2,  # width padding
+               (img1_shape[1] - img0_shape[1] * gain) / 2,  # height padding
+               (img1_shape[0] - img0_shape[0] * gain) / 2)  # depth padding
+    else:
+        gain = ratio_pad[0][0]
+        pad = ratio_pad[1]
+
+    if padding:
+        boxes[..., 0] -= pad[0]  # x padding
+        boxes[..., 1] -= pad[1]  # y padding
+        boxes[..., 2] -= pad[2]  # z padding
+        if not xyzwhd:
+            boxes[..., 3] -= pad[0]  # x padding
+            boxes[..., 4] -= pad[1]  # y padding
+            boxes[..., 5] -= pad[2]  # z padding
+
+    boxes[..., :6] /= gain
+    return clip_boxes_3d(boxes, img0_shape)

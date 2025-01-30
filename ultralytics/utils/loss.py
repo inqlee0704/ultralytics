@@ -5,12 +5,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.metrics import OKS_SIGMA
-from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh, xyzwhd2xyzxyz, xyzxyz2xyzwhd
+from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, TaskAlignedAssigner3D, dist2bbox, dist2rbox, make_anchors, make_anchors_3d
 from ultralytics.utils.torch_utils import autocast
 
-from .metrics import bbox_iou, probiou
-from .tal import bbox2dist
+from .metrics import bbox_iou, probiou, bbox_iou_3d
+from .tal import bbox2dist, bbox2dist_3d
+from .tal import dist2bbox_3d
 
 
 class VarifocalLoss(nn.Module):
@@ -88,6 +89,44 @@ class DFLoss(nn.Module):
         ).mean(-1, keepdim=True)
 
 
+class DFLoss3D(nn.Module):
+    """Criterion class for computing Distribution Focal Loss for 3D boxes."""
+
+    def __init__(self, reg_max=16) -> None:
+        super().__init__()
+        self.reg_max = reg_max
+
+    def __call__(self, pred_dist, target):
+        """
+        Return sum of DFL losses for 3D box coordinates.
+        Args:
+            pred_dist: (b, h*w*d, reg_max*6)
+            target: (b, h*w*d, 6)
+        """
+        target = target.clamp_(0, self.reg_max - 1 - 0.01)
+        tl = target.long()  # target left
+        tr = tl + 1  # target right
+        wl = tr - target  # weight left
+        wr = 1 - wl  # weight right
+
+        # Reshape pred_dist to (N, 6, reg_max) where N = b * h*w*d
+        pred_dist = pred_dist.reshape(-1, 6, self.reg_max).half()  # Convert to float16
+        
+        # Flatten targets but keep the 6 dimensions separate
+        tl = tl.reshape(-1, 6)
+        tr = tr.reshape(-1, 6)
+        wl = wl.reshape(-1, 6)
+        wr = wr.reshape(-1, 6)
+
+        # Calculate loss for each dimension
+        loss = torch.zeros_like(tl[:, 0:1]).float()
+        for i in range(6):  # For each dimension (x,y,z,w,h,d)
+            loss += F.cross_entropy(pred_dist[:, i], tl[:, i], reduction='none').unsqueeze(1) * wl[:, i:i+1]
+            loss += F.cross_entropy(pred_dist[:, i], tr[:, i], reduction='none').unsqueeze(1) * wr[:, i:i+1]
+
+        return loss.mean(-1, keepdim=True)
+
+
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses during training."""
 
@@ -112,6 +151,37 @@ class BboxLoss(nn.Module):
 
         return loss_iou, loss_dfl
 
+class BboxLoss3D(nn.Module):
+    """Criterion class for computing 3D bounding box loss."""
+
+    def __init__(self, reg_max=16):
+        super().__init__()
+        self.dfl_loss = DFLoss3D(reg_max) if reg_max > 1 else None
+        # self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
+        """Calculate IoU and DFL losses for 3D boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # Calculate 3D IoU
+        iou = bbox_iou_3d(pred_bboxes[fg_mask], target_bboxes[fg_mask], xyzwhd=False, CIoU=True)
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrfbt = bbox2dist_3d(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            dist_3d = pred_dist[fg_mask]
+            targ_3d = target_ltrfbt[fg_mask]
+            loss_dfl = self.dfl_loss(dist_3d, targ_3d) * weight
+            # loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), 
+            #                        target_ltrfbt[fg_mask]) * weight
+            # loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max * 6), 
+            #                        target_ltrfbt[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+
+        return loss_iou, loss_dfl
 
 class RotatedBboxLoss(BboxLoss):
     """Criterion class for computing training losses during training."""
@@ -741,3 +811,120 @@ class E2EDetectLoss:
         one2one = preds["one2one"]
         loss_one2one = self.one2one(one2one, batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
+
+
+class v8DetectionLoss3D:
+    """Criterion class for computing training losses for 3D detection."""
+
+    def __init__(self, model, tal_topk=10):  # model must be de-paralleled
+        """Initialize v8Detection3DLoss with model parameters."""
+        device = next(model.parameters()).device  # get model device
+        h = model.args  # hyperparameters
+
+        m = model.model[-1]  # Detect() module
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.hyp = h
+        self.stride = torch.tensor([8, 16, 32])  # model strides
+        # self.stride = m.stride  # model strides
+        self.nc = m.nc  # number of classes
+        self.no = m.nc + m.reg_max * 6  # number of outputs per anchor (changed from 4 to 6 for 3D)
+        self.reg_max = m.reg_max
+        self.device = device
+
+        self.use_dfl = m.reg_max > 1
+        self.assigner = TaskAlignedAssigner3D(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
+        # self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.bbox_loss = BboxLoss3D(m.reg_max).to(device)  # Using 3D version
+        self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
+    def preprocess(self, targets, batch_size, scale_tensor):
+        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
+        nl, ne = targets.shape
+        if nl == 0:
+            out = torch.zeros(batch_size, 0, ne-1, device=self.device)  # changed from 5 to 7 for 3D (cls + xyzwhd)
+        else:
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), ne-1, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    out[j, :n] = targets[matches, 1:]
+            # Scale 3D boxes by img_size
+            out[..., 1:7] = xyzwhd2xyzxyz(out[..., 1:7].mul_(scale_tensor))  # Scale xyzwhd
+        return out
+
+    def bbox_decode(self, anchor_points, pred_dist):
+        """Decode predicted object bounding box coordinates from anchor points and distribution."""
+        if self.use_dfl:
+            b, a, c = pred_dist.shape  # batch, anchors, channels
+            pred_dist = pred_dist.view(b, a, 6, c // 6).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+        return dist2bbox_3d(pred_dist, anchor_points, xyzwhd=False)
+
+    def __call__(self, preds, batch):
+        """Calculate the sum of the 3D detection loss for box, cls and dfl multiplied by batch size."""
+        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 6, self.nc), 1  # Changed from 4 to 6 for 3D
+        )
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors_3d(feats, self.stride, 0.5)  # Using 3D version
+
+        # Targets
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, 
+                                scale_tensor=imgsz[[0, 1, 2, 0, 1, 2]])  # Scale for xyz dimensions
+        gt_labels, gt_bboxes = targets.split((1, 6), 2)  # cls, xyzwhd
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxyzz
+
+        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        # Cls loss
+        n_pos = fg_mask.sum()
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / max(n_pos, 1)  # BCE
+        # loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # Bbox loss
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+            )
+        else:
+            loss[0] += (pred_bboxes * 0).sum()
+
+        # loss[0] *= 0.001
+        # loss[1] *= 0.001
+        # loss[2] *= 0.001
+
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)

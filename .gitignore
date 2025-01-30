@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+CZII_CryoET_yolo2D/
 
 # C extensions
 *.so

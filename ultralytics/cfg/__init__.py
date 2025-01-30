@@ -291,7 +291,7 @@ def get_cfg(cfg: Union[str, Path, Dict, SimpleNamespace] = DEFAULT_CFG_DICT, ove
         - The function performs type and value checks on the configuration data.
     """
     cfg = cfg2dict(cfg)
-    cfg = overrides
+    # cfg = overrides
 
     # Merge overrides
     if overrides:

@@ -6,19 +6,107 @@ from tqdm import tqdm
 from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics3d import Metric3D
 from ultralytics.utils.plotting3d import Plot3D
+from ultralytics.nn.autobackend import AutoBackend
+from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
+from ultralytics.utils import LOGGER, TQDM, callbacks, colorstr, emojis
+from ultralytics.utils.metrics import box_iou_3d
+from ultralytics.utils.ops import Profile
+import time
+from pathlib import Path
+import torchvision
 
 class BaseValidator3D:
     """Base validator for 3D object detection."""
     
-    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None):
+    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
         """Initialize 3D validator."""
         self.dataloader = dataloader
         self.save_dir = save_dir
         self.pbar = pbar
         self.args = args
-        self.metrics = Metric3D(nc=args.nc)
+        self.args.task = "detect3d"
+        self.args.iou_thres = 0.5
+        # self.metrics = Metric3D(nc=6)
+        # self.metrics = Metric3D(nc=args.nc)
         self.plot = Plot3D()
         
+    @smart_inference_mode()
+    def __call__(self, trainer=None, model=None):
+        """Executes 3D validation process."""
+        self.training = trainer is not None
+        if self.training:
+            self.device = trainer.device
+            self.data = trainer.data
+            self.args.half = self.device.type != "cpu" and trainer.amp
+            model = trainer.ema.ema or trainer.model
+            model = model.half() if self.args.half else model.float()
+            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
+            self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
+            model.eval()
+        else:
+            self.device = select_device(self.args.device, self.args.batch)
+            self.args.half = self.device.type != "cpu"
+            model = AutoBackend(
+                weights=model or self.args.model,
+                device=self.device,
+                dnn=self.args.dnn,
+                fp16=self.args.half
+            )
+            self.device = model.device
+            self.args.half = model.fp16
+            model.eval()
+            model.warmup()  # warmup model
+
+        dt = [Profile(device=self.device) for _ in range(4)]
+        bar = TQDM(self.dataloader, desc="Validating", total=len(self.dataloader))
+        self.seen = 0
+        # self.metrics.reset()
+        self.init_metrics(de_parallel(model))
+        
+        for batch_i, batch in enumerate(bar):
+            self.batch_i = batch_i
+            # Preprocess
+            with dt[0]:
+                batch = self.preprocess(batch)
+
+            # Inference
+            with dt[1]:
+                preds = model(batch["img"])
+
+            # Loss
+            with dt[2]:
+                if self.training:
+                    self.loss += model.loss(batch, preds)[1]
+
+            # Postprocess
+            with dt[3]:
+                preds = self.postprocess(preds)
+
+            self.update_metrics(preds, batch)
+            
+            # Visualization
+            if self.args.plots and batch_i < 3:
+                self.plot.plot_3d_predictions(batch, preds, batch_i, self.save_dir)
+
+        # Calculate statistics
+        # stats = self.metrics.evaluate(iou_thres=self.args.iou_thres)
+        stats = self.get_stats()
+        self.speed = dict(zip(['preprocess', 'inference', 'loss', 'postprocess'],
+                            (x.t / len(self.dataloader.dataset) * 1E3 for x in dt)))
+
+        # Print results
+        LOGGER.info(f"Speed: {self.speed['preprocess']:.1f}ms preprocess, "
+                    f"{self.speed['inference']:.1f}ms inference, "
+                    f"{self.speed['loss']:.1f}ms loss, "
+                    f"{self.speed['postprocess']:.1f}ms postprocess per volume")
+        # LOGGER.info(f"mAP@{self.args.iou_thres:.2f}: {stats[0]:.4f}")
+
+        if self.training:
+            model.float()
+            results = {**stats, **trainer.label_loss_items(self.loss.cpu() / len(self.dataloader), prefix="val")}
+            return {k: round(float(v), 5) for k, v in results.items()}
+        return stats 
+
     def preprocess(self, batch):
         """Preprocess batch data."""
         batch["volume"] = batch["volume"].to(self.device, non_blocking=True)
@@ -94,7 +182,7 @@ class BaseValidator3D:
             for *box, conf, cls in pred:
                 if nl:
                     # Find best matching label
-                    iou, j = bbox3d_iou(torch.tensor(box).unsqueeze(0), labels[:, :6]).max(0)
+                    iou, j = box_iou_3d(torch.tensor(box).unsqueeze(0), labels[:, :6]).max(0)
                     if iou > self.args.iou_thres:
                         tp.append(1)
                         conf.append(conf)
@@ -134,3 +222,7 @@ class BaseValidator3D:
         stats = self.metrics.evaluate(iou_thres=self.args.iou_thres)
         LOGGER.info(f"mAP@{self.args.iou_thres:.2f}: {stats[0]:.4f}")
         return stats 
+
+    def on_plot(self, name, data=None):
+        """Registers plots (e.g. to be consumed in callbacks)."""
+        self.plots[Path(name)] = {"data": data, "timestamp": time.time()}

@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from . import LOGGER
 from .checks import check_version
-from .metrics import bbox_iou, probiou
+from .metrics import bbox_iou, probiou, bbox_iou_3d
 from .ops import xywhr2xyxyxyxy
 
 TORCH_1_10 = check_version(torch.__version__, "1.10.0")
@@ -119,7 +119,8 @@ class TaskAlignedAssigner(nn.Module):
 
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
         """Get in_gts mask, (b, max_num_obj, h*w)."""
-        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes)
+        # mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes)
+        mask_in_gts = self.select_candidates_in_gts_3d(anc_points, gt_bboxes)
         # Get anchor_align metric, (b, max_num_obj, h*w)
         align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
         # Get topk_metric mask, (b, max_num_obj, h*w)
@@ -383,3 +384,174 @@ def dist2rbox(pred_dist, pred_angle, anchor_points, dim=-1):
     x, y = xf * cos - yf * sin, xf * sin + yf * cos
     xy = torch.cat([x, y], dim=dim) + anchor_points
     return torch.cat([xy, lt + rb], dim=dim)
+
+
+def make_anchors_3d(feats, strides, grid_cell_offset=0.5):
+    """Generate 3D anchors from features."""
+    anchor_points, stride_tensor = [], []
+    assert feats is not None
+    dtype, device = feats[0].dtype, feats[0].device
+    for i, stride in enumerate(strides):
+        if isinstance(feats, list):
+            shape = feats[i].shape[2:]  # Get spatial dimensions (h, w, d)
+            h, w, d = shape[0], shape[1], shape[2]
+        else:
+            h, w = int(feats[i][0]), int(feats[i][1])
+            d = int(feats[i][2]) if len(feats[i]) > 2 else 1
+
+        sx = torch.arange(end=w, device=device, dtype=dtype) + grid_cell_offset  # shift x
+        sy = torch.arange(end=h, device=device, dtype=dtype) + grid_cell_offset  # shift y
+        sz = torch.arange(end=d, device=device, dtype=dtype) + grid_cell_offset  # shift z
+        
+        if TORCH_1_10:
+            sz, sy, sx = torch.meshgrid(sz, sy, sx, indexing="ij")
+        else:
+            sz, sy, sx = torch.meshgrid(sz, sy, sx)
+            
+        anchor_points.append(torch.stack((sx, sy, sz), -1).reshape(-1, 3))
+        stride_tensor.append(torch.full((h * w * d, 1), stride, dtype=dtype, device=device))
+    
+    return torch.cat(anchor_points), torch.cat(stride_tensor)
+
+
+def dist2bbox_3d(distance, anchor_points, xyzwhd=True, dim=-1):
+    """Transform distance(ltrbfb - left,top,right,bottom,front,back) to box(xyzwhd or xyxyzz)."""
+    ltf, rbb = distance.chunk(2, dim)  # left-top-front, right-bottom-back
+    x1y1z1 = anchor_points - ltf
+    x2y2z2 = anchor_points + rbb
+    if xyzwhd:
+        c_xyz = (x1y1z1 + x2y2z2) / 2
+        whd = x2y2z2 - x1y1z1
+        return torch.cat((c_xyz, whd), dim)  # xyzwhd bbox
+    return torch.cat((x1y1z1, x2y2z2), dim)  # xyxyzz bbox
+
+
+def bbox2dist_3d(anchor_points, bbox, reg_max):
+    """Transform bbox(xyxyzz) to dist(ltrbfb)."""
+    x1y1z1, x2y2z2 = bbox.chunk(2, -1)
+    return torch.cat((anchor_points - x1y1z1, x2y2z2 - anchor_points), -1).clamp_(0, reg_max - 0.01)  # dist (ltf, rbb)
+
+
+def dist2rbox_3d(pred_dist, pred_angles, anchor_points, dim=-1):
+    """
+    Decode predicted 3D rotated bounding box coordinates from anchor points and distribution.
+    
+    Args:
+        pred_dist (torch.Tensor): Predicted rotated distance, shape (bs, h*w*d, 6).
+        pred_angles (torch.Tensor): Predicted angles (roll, pitch, yaw), shape (bs, h*w*d, 3).
+        anchor_points (torch.Tensor): Anchor points, shape (h*w*d, 3).
+        dim (int, optional): Dimension along which to split. Defaults to -1.
+        
+    Returns:
+        (torch.Tensor): Predicted rotated 3D bounding boxes, shape (bs, h*w*d, 6).
+    """
+    ltf, rbb = pred_dist.split(3, dim=dim)  # left-top-front, right-bottom-back
+    roll, pitch, yaw = pred_angles.split(1, dim=dim)
+    
+    # Create rotation matrices for each angle
+    cos_r, sin_r = torch.cos(roll), torch.sin(roll)
+    cos_p, sin_p = torch.cos(pitch), torch.sin(pitch)
+    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+    
+    # Calculate center offsets
+    xf, yf, zf = ((rbb - ltf) / 2).split(1, dim=dim)
+    
+    # Apply 3D rotation transformation
+    # Note: This is a simplified rotation. For more accurate results, 
+    # use complete 3D rotation matrices multiplication
+    x = xf * cos_y * cos_p
+    y = yf * (cos_y * sin_p * sin_r + sin_y * cos_r)
+    z = zf * (cos_y * sin_p * cos_r - sin_y * sin_r)
+    
+    xyz = torch.cat([x, y, z], dim=dim) + anchor_points
+    return torch.cat([xyz, ltf + rbb], dim=dim)
+
+
+class TaskAlignedAssigner3D(TaskAlignedAssigner):
+    """
+    A task-aligned assigner for 3D object detection.
+
+    This class assigns ground-truth (gt) objects to anchors based on the task-aligned metric in 3D space,
+    combining both classification and localization information.
+
+    Attributes:
+        topk (int): The number of top candidates to consider.
+        num_classes (int): The number of object classes.
+        alpha (float): The alpha parameter for the classification component.
+        beta (float): The beta parameter for the localization component.
+        eps (float): A small value to prevent division by zero.
+    """
+    def __init__(self, topk=20, num_classes=6, alpha=0.5, beta=6.0, eps=1e-9):
+        super().__init__(topk, num_classes, alpha, beta, eps)
+
+    def iou_calculation(self, gt_bboxes, pd_bboxes):
+        """IoU calculation for 3D bounding boxes."""
+        # Note: Implement 3D IoU calculation here
+        # This is a placeholder - you'll need to implement actual 3D IoU calculation
+        return bbox_iou_3d(gt_bboxes, pd_bboxes, xyzwhd=False, CIoU=True).squeeze(-1).clamp_(0)
+
+    @staticmethod
+    def select_candidates_in_gts_3d(xyz_centers, gt_bboxes, eps=1e-9):
+        """
+        Select positive anchor centers within 3D ground truth bounding boxes.
+
+        Args:
+            xyz_centers (torch.Tensor): Anchor center coordinates, shape (h*w*d, 3).
+            gt_bboxes (torch.Tensor): Ground truth 3D bounding boxes, shape (b, n_boxes, 6).
+            eps (float, optional): Small value for numerical stability. Defaults to 1e-9.
+
+        Returns:
+            (torch.Tensor): Boolean mask of positive anchors, shape (b, n_boxes, h*w*d).
+        """
+        n_anchors = xyz_centers.shape[0]
+        bs, n_boxes, _ = gt_bboxes.shape
+        
+        # Split boxes into min and max points (left-top-front, right-bottom-back)
+        ltf, rbb = gt_bboxes.view(-1, 1, 6).chunk(2, 2)  
+        
+        # Calculate deltas for all dimensions
+        bbox_deltas = torch.cat(
+            (xyz_centers[None] - ltf, rbb - xyz_centers[None]), 
+            dim=2
+        ).view(bs, n_boxes, n_anchors, -1)
+        
+        return bbox_deltas.amin(3).gt_(eps)
+
+    def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
+        """Compute alignment metric given predicted and ground truth 3D bounding boxes."""
+        # Implementation remains similar to 2D version, but works with 3D boxes
+        na = pd_bboxes.shape[-2]
+        mask_gt = mask_gt.bool()
+        overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
+        bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+
+        ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)
+        ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)
+        ind[1] = gt_labels.squeeze(-1)
+        
+        bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]
+
+        # Handle 3D boxes
+        pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
+        gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
+        overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
+
+        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
+        return align_metric, overlaps
+
+    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        """
+        Compute the task-aligned assignment for 3D objects.
+
+        Args:
+            pd_scores (Tensor): shape(bs, num_total_anchors, num_classes)
+            pd_bboxes (Tensor): shape(bs, num_total_anchors, 6) for 3D boxes
+            anc_points (Tensor): shape(num_total_anchors, 3) for 3D points
+            gt_labels (Tensor): shape(bs, n_max_boxes, 1)
+            gt_bboxes (Tensor): shape(bs, n_max_boxes, 6) for 3D boxes
+            mask_gt (Tensor): shape(bs, n_max_boxes, 1)
+
+        Returns:
+            Same as 2D version but with 3D boxes
+        """
+        return super().forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)

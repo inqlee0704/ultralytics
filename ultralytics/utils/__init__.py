@@ -1319,3 +1319,50 @@ torch.save = torch_save
 if WINDOWS:
     # Apply cv2 patches for non-ASCII and non-UTF characters in image paths
     cv2.imread, cv2.imwrite, cv2.imshow = imread, imwrite, imshow
+
+# def yaml_model_load(path):
+#     """Load a YOLOv8 model from a YAML file."""
+#     import re
+#     path = Path(path)
+#     if path.stem in (f"yolov{d}{x}6" for x in "nsmlx" for d in (5, 8)):
+#         new_stem = re.sub(r"(\d+)([nslmx])6(.+)?$", r"\1\2-p6\3", path.stem)
+#         LOGGER.warning(f"WARNING ⚠️ Ultralytics YOLO P6 models now use -p6 suffix. Renaming {path.stem} to {new_stem}.")
+#         path = path.with_name(new_stem + path.suffix)
+
+#     # Load yaml
+#     with open(path, encoding='ascii', errors='ignore') as f:
+#         cfg = yaml.safe_load(f)
+
+#     # Handle inheritance
+#     if 'inherits' in cfg:
+#         try:
+#             # First try relative to the current file
+#             base_path = path.parent / cfg['inherits']
+#             if not base_path.exists():
+#                 # Then try relative to the ultralytics cfg directory
+#                 base_path = Path(__file__).parent.parent / 'cfg' / 'models' / '11' / cfg['inherits']
+            
+#             if not base_path.exists():
+#                 raise FileNotFoundError(f"Base YAML file '{cfg['inherits']}' not found")
+                
+#             LOGGER.info(f'Loading base config from: {base_path}')
+#             with open(base_path, encoding='ascii', errors='ignore') as f:
+#                 base_cfg = yaml.safe_load(f)
+                
+#             # Merge configurations
+#             merged_cfg = base_cfg.copy()  # Make a copy of base config
+#             for k, v in cfg.items():
+#                 if k != 'inherits':
+#                     merged_cfg[k] = v
+#             cfg = merged_cfg
+            
+#         except Exception as e:
+#             raise KeyError(f"Error loading base config '{cfg['inherits']}': {e}")
+
+#     # Ensure required keys exist
+#     if 'backbone' not in cfg:
+#         raise KeyError(f"Model YAML must contain 'backbone' definition. Current keys: {list(cfg.keys())}")
+#     if 'head' not in cfg:
+#         raise KeyError("Model YAML must contain 'head' definition")
+
+#     return cfg

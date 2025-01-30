@@ -1292,3 +1292,276 @@ class OBBMetrics(SimpleClass):
     def curves_results(self):
         """Returns a list of curves for accessing specific metrics curves."""
         return []
+
+
+def box_iou_3d(box1, box2):
+    """
+    Calculate 3D IoU between two sets of boxes.
+    
+    Args:
+        box1 (torch.Tensor): First set of boxes (N, 6) in (x1, y1, z1, w1, h1, d1) format
+        box2 (torch.Tensor): Second set of boxes (M, 6) in (x2, y2, z2, w2, h2, d2) format
+        
+    Returns:
+        torch.Tensor: IoU matrix of shape (N, M) containing IoU values for all pairs of boxes
+    """
+    # Convert boxes from (x, y, z, w, h, d) to (x1, y1, z1, x2, y2, z2)
+    b1_mins = box1[:, :3] - box1[:, 3:] / 2  # (N, 3)
+    b1_maxs = box1[:, :3] + box1[:, 3:] / 2  # (N, 3)
+    b2_mins = box2[:, :3] - box2[:, 3:] / 2  # (M, 3)
+    b2_maxs = box2[:, :3] + box2[:, 3:] / 2  # (M, 3)
+    
+    # Get box volumes
+    b1_volumes = box1[:, 3] * box1[:, 4] * box1[:, 5]  # (N,)
+    b2_volumes = box2[:, 3] * box2[:, 4] * box2[:, 5]  # (M,)
+    
+    # Find intersections in each dimension
+    # Expand dimensions for broadcasting
+    b1_mins = b1_mins[:, None, :]  # (N, 1, 3)
+    b1_maxs = b1_maxs[:, None, :]  # (N, 1, 3)
+    b2_mins = b2_mins[None, :, :]  # (1, M, 3)
+    b2_maxs = b2_maxs[None, :, :]  # (1, M, 3)
+    
+    # Calculate intersection points
+    intersect_mins = torch.maximum(b1_mins, b2_mins)  # (N, M, 3)
+    intersect_maxs = torch.minimum(b1_maxs, b2_maxs)  # (N, M, 3)
+    
+    # Calculate intersection volumes
+    deltas = torch.clamp(intersect_maxs - intersect_mins, min=0)  # (N, M, 3)
+    intersection = deltas[..., 0] * deltas[..., 1] * deltas[..., 2]  # (N, M)
+    
+    # Calculate union volumes
+    union = b1_volumes[:, None] + b2_volumes[None, :] - intersection  # (N, M)
+    
+    # Calculate IoU
+    iou = intersection / (union + torch.finfo(union.dtype).eps)
+    
+    return iou
+
+def box_iou_3d_diou(box1, box2):
+    """
+    Calculate 3D DIoU (Distance IoU) between two sets of boxes.
+    DIoU adds a distance term to the IoU calculation to better handle non-overlapping boxes.
+    
+    Args:
+        box1 (torch.Tensor): First set of boxes (N, 6) in (x1, y1, z1, w1, h1, d1) format
+        box2 (torch.Tensor): Second set of boxes (M, 6) in (x2, y2, z2, w2, h2, d2) format
+        
+    Returns:
+        torch.Tensor: DIoU matrix of shape (N, M) containing DIoU values for all pairs of boxes
+    """
+    # Calculate regular IoU first
+    iou = box_iou_3d(box1, box2)
+    
+    # Get box centers
+    b1_centers = box1[:, :3]  # (N, 3)
+    b2_centers = box2[:, :3]  # (M, 3)
+    
+    # Expand dimensions for broadcasting
+    b1_centers = b1_centers[:, None, :]  # (N, 1, 3)
+    b2_centers = b2_centers[None, :, :]  # (1, M, 3)
+    
+    # Calculate squared L2 distance between centers
+    center_dist = torch.sum((b1_centers - b2_centers) ** 2, dim=-1)  # (N, M)
+    
+    # Find the diagonal length of the smallest enclosing box
+    # Convert boxes to mins and maxs
+    b1_mins = box1[:, :3] - box1[:, 3:] / 2  # (N, 3)
+    b1_maxs = box1[:, :3] + box1[:, 3:] / 2  # (N, 3)
+    b2_mins = box2[:, :3] - box2[:, 3:] / 2  # (M, 3)
+    b2_maxs = box2[:, :3] + box2[:, 3:] / 2  # (M, 3)
+    
+    # Expand dimensions
+    b1_mins = b1_mins[:, None, :]  # (N, 1, 3)
+    b1_maxs = b1_maxs[:, None, :]  # (N, 1, 3)
+    b2_mins = b2_mins[None, :, :]  # (1, M, 3)
+    b2_maxs = b2_maxs[None, :, :]  # (1, M, 3)
+    
+    # Find enclosing box
+    enclosing_mins = torch.minimum(b1_mins, b2_mins)  # (N, M, 3)
+    enclosing_maxs = torch.maximum(b1_maxs, b2_maxs)  # (N, M, 3)
+    
+    # Calculate diagonal squared
+    diagonal_squared = torch.sum((enclosing_maxs - enclosing_mins) ** 2, dim=-1)  # (N, M)
+    
+    # Calculate DIoU
+    diou = iou - (center_dist / (diagonal_squared + torch.finfo(diagonal_squared.dtype).eps))
+    
+    return diou
+
+def box_iou_3d_giou(box1, box2):
+    """
+    Calculate 3D GIoU (Generalized IoU) between two sets of boxes.
+    GIoU adds a term considering the volume of the smallest enclosing box.
+    
+    Args:
+        box1 (torch.Tensor): First set of boxes (N, 6) in (x1, y1, z1, w1, h1, d1) format
+        box2 (torch.Tensor): Second set of boxes (M, 6) in (x2, y2, z2, w2, h2, d2) format
+        
+    Returns:
+        torch.Tensor: GIoU matrix of shape (N, M) containing GIoU values for all pairs of boxes
+    """
+    # Calculate regular IoU and get volumes
+    b1_mins = box1[:, :3] - box1[:, 3:] / 2  # (N, 3)
+    b1_maxs = box1[:, :3] + box1[:, 3:] / 2  # (N, 3)
+    b2_mins = box2[:, :3] - box2[:, 3:] / 2  # (M, 3)
+    b2_maxs = box2[:, :3] + box2[:, 3:] / 2  # (M, 3)
+    
+    # Get box volumes
+    b1_volumes = box1[:, 3] * box1[:, 4] * box1[:, 5]  # (N,)
+    b2_volumes = box2[:, 3] * box2[:, 4] * box2[:, 5]  # (M,)
+    
+    # Expand dimensions
+    b1_mins = b1_mins[:, None, :]  # (N, 1, 3)
+    b1_maxs = b1_maxs[:, None, :]  # (N, 1, 3)
+    b2_mins = b2_mins[None, :, :]  # (1, M, 3)
+    b2_maxs = b2_maxs[None, :, :]  # (1, M, 3)
+    
+    # Calculate intersection points
+    intersect_mins = torch.maximum(b1_mins, b2_mins)  # (N, M, 3)
+    intersect_maxs = torch.minimum(b1_maxs, b2_maxs)  # (N, M, 3)
+    
+    # Calculate intersection volumes
+    deltas = torch.clamp(intersect_maxs - intersect_mins, min=0)  # (N, M, 3)
+    intersection = deltas[..., 0] * deltas[..., 1] * deltas[..., 2]  # (N, M)
+    
+    # Calculate union volumes
+    union = b1_volumes[:, None] + b2_volumes[None, :] - intersection  # (N, M)
+    
+    # Calculate IoU
+    iou = intersection / (union + torch.finfo(union.dtype).eps)
+    
+    # Find enclosing box
+    enclosing_mins = torch.minimum(b1_mins, b2_mins)  # (N, M, 3)
+    enclosing_maxs = torch.maximum(b1_maxs, b2_maxs)  # (N, M, 3)
+    
+    # Calculate enclosing box volume
+    deltas = torch.clamp(enclosing_maxs - enclosing_mins, min=0)  # (N, M, 3)
+    enclosing_volume = deltas[..., 0] * deltas[..., 1] * deltas[..., 2]  # (N, M)
+    
+    # Calculate GIoU
+    giou = iou - ((enclosing_volume - union) / (enclosing_volume + torch.finfo(enclosing_volume.dtype).eps))
+    
+    return giou
+
+
+def bbox_iou_3d(box1, box2, xyzwhd=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+    """
+    Calculate 3D IoU between boxes with options for GIoU, DIoU, and CIoU.
+    
+    Args:
+        box1 (torch.Tensor): First set of boxes (N, 6)
+        box2 (torch.Tensor): Second set of boxes (N, 6)
+        xyzwhd (bool): If True, boxes are in (x,y,z,w,h,d) format, else (x1,y1,z1,x2,y2,z2)
+        GIoU (bool): Whether to calculate GIoU
+        DIoU (bool): Whether to calculate DIoU
+        CIoU (bool): Whether to calculate CIoU
+        eps (float): Small value to prevent division by zero
+        
+    Returns:
+        (torch.Tensor): IoU, GIoU, DIoU, or CIoU values
+    """
+    # Get box coordinates
+    if xyzwhd:
+        # Convert from center to corner format
+        b1_x1, b1_y1, b1_z1 = box1[..., 0] - box1[..., 3] / 2, box1[..., 1] - box1[..., 4] / 2, box1[..., 2] - box1[..., 5] / 2
+        b1_x2, b1_y2, b1_z2 = box1[..., 0] + box1[..., 3] / 2, box1[..., 1] + box1[..., 4] / 2, box1[..., 2] + box1[..., 5] / 2
+        b2_x1, b2_y1, b2_z1 = box2[..., 0] - box2[..., 3] / 2, box2[..., 1] - box2[..., 4] / 2, box2[..., 2] - box2[..., 5] / 2
+        b2_x2, b2_y2, b2_z2 = box2[..., 0] + box2[..., 3] / 2, box2[..., 1] + box2[..., 4] / 2, box2[..., 2] + box2[..., 5] / 2
+        w1, h1, d1 = box1[..., 3], box1[..., 4], box1[..., 5]
+        w2, h2, d2 = box2[..., 3], box2[..., 4], box2[..., 5]
+    else:
+        b1_x1, b1_y1, b1_z1, b1_x2, b1_y2, b1_z2 = box1[..., 0], box1[..., 1], box1[..., 2], box1[..., 3], box1[..., 4], box1[..., 5]
+        b2_x1, b2_y1, b2_z1, b2_x2, b2_y2, b2_z2 = box2[..., 0], box2[..., 1], box2[..., 2], box2[..., 3], box2[..., 4], box2[..., 5]
+        w1, h1, d1 = b1_x2 - b1_x1, b1_y2 - b1_y1, b1_z2 - b1_z1
+        w2, h2, d2 = b2_x2 - b2_x1, b2_y2 - b2_y1, b2_z2 - b2_z1
+
+    # Intersection volume
+    x1 = torch.max(b1_x1, b2_x1)
+    y1 = torch.max(b1_y1, b2_y1)
+    z1 = torch.max(b1_z1, b2_z1)
+    x2 = torch.min(b1_x2, b2_x2)
+    y2 = torch.min(b1_y2, b2_y2)
+    z2 = torch.min(b1_z2, b2_z2)
+
+    intersection = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0) * torch.clamp(z2 - z1, min=0)
+
+    # Union volume
+    vol1 = (b1_x2 - b1_x1) * (b1_y2 - b1_y1) * (b1_z2 - b1_z1)
+    vol2 = (b2_x2 - b2_x1) * (b2_y2 - b2_y1) * (b2_z2 - b2_z1)
+    union = vol1 + vol2 - intersection + eps
+
+    # IoU
+    iou = intersection / union
+    if CIoU or DIoU or GIoU:
+        # Enclosing box
+        c_x1 = torch.min(b1_x1, b2_x1)
+        c_y1 = torch.min(b1_y1, b2_y1)
+        c_z1 = torch.min(b1_z1, b2_z1)
+        c_x2 = torch.max(b1_x2, b2_x2)
+        c_y2 = torch.max(b1_y2, b2_y2)
+        c_z2 = torch.max(b1_z2, b2_z2)
+        
+        # Diagonal squared of the enclosing box
+        c_diag = ((c_x2 - c_x1) ** 2 + (c_y2 - c_y1) ** 2 + (c_z2 - c_z1) ** 2) + eps
+        
+        if CIoU or DIoU:
+            # Center distance squared
+            center_dist = (((b1_x1 + b1_x2) - (b2_x1 + b2_x2)) ** 2 +
+                         ((b1_y1 + b1_y2) - (b2_y1 + b2_y2)) ** 2 +
+                         ((b1_z1 + b1_z2) - (b2_z1 + b2_z2)) ** 2) / 4
+            
+            if CIoU:
+                # Calculate aspect ratio term
+                v = (4 / (math.pi ** 2) * 
+                    torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2) +
+                    torch.pow(torch.atan(w2 / d2) - torch.atan(w1 / d1), 2) +
+                    torch.pow(torch.atan(h2 / d2) - torch.atan(h1 / d1), 2))
+                
+                with torch.no_grad():
+                    alpha = v / (v - iou + (1 + eps))
+                return iou - (center_dist / c_diag + v * alpha)  # CIoU
+            
+            return iou - center_dist / c_diag  # DIoU
+        
+        # GIoU
+        c_vol = (c_x2 - c_x1) * (c_y2 - c_y1) * (c_z2 - c_z1) + eps
+        return iou - (c_vol - union) / c_vol  # GIoU
+    
+    return iou
+
+# def bbox_iou_3d(box1, box2, xyzwhd=True, eps=1e-7):
+#     """
+#     Calculate 3D IoU between boxes.
+#     Args:
+#         box1, box2: Boxes in either (x,y,z,w,h,d) or (x1,y1,z1,x2,y2,z2) format
+#         xyzwhd: If True, boxes are in (x,y,z,w,h,d) format, else (x1,y1,z1,x2,y2,z2)
+#     Returns:
+#         Tensor: IoU values between boxes
+#     """
+#     if xyzwhd:
+#         # Convert from center to corner format
+#         b1_x1, b1_y1, b1_z1 = box1[..., 0] - box1[..., 3] / 2, box1[..., 1] - box1[..., 4] / 2, box1[..., 2] - box1[..., 5] / 2
+#         b1_x2, b1_y2, b1_z2 = box1[..., 0] + box1[..., 3] / 2, box1[..., 1] + box1[..., 4] / 2, box1[..., 2] + box1[..., 5] / 2
+#         b2_x1, b2_y1, b2_z1 = box2[..., 0] - box2[..., 3] / 2, box2[..., 1] - box2[..., 4] / 2, box2[..., 2] - box2[..., 5] / 2
+#         b2_x2, b2_y2, b2_z2 = box2[..., 0] + box2[..., 3] / 2, box2[..., 1] + box2[..., 4] / 2, box2[..., 2] + box2[..., 5] / 2
+#     else:
+#         b1_x1, b1_y1, b1_z1, b1_x2, b1_y2, b1_z2 = box1[..., 0], box1[..., 1], box1[..., 2], box1[..., 3], box1[..., 4], box1[..., 5]
+#         b2_x1, b2_y1, b2_z1, b2_x2, b2_y2, b2_z2 = box2[..., 0], box2[..., 1], box2[..., 2], box2[..., 3], box2[..., 4], box2[..., 5]
+
+#     # Intersection volume
+#     x1 = torch.max(b1_x1, b2_x1)
+#     y1 = torch.max(b1_y1, b2_y1)
+#     z1 = torch.max(b1_z1, b2_z1)
+#     x2 = torch.min(b1_x2, b2_x2)
+#     y2 = torch.min(b1_y2, b2_y2)
+#     z2 = torch.min(b1_z2, b2_z2)
+
+#     intersection = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0) * torch.clamp(z2 - z1, min=0)
+
+#     # Union volume
+#     vol1 = (b1_x2 - b1_x1) * (b1_y2 - b1_y1) * (b1_z2 - b1_z1)
+#     vol2 = (b2_x2 - b2_x1) * (b2_y2 - b2_y1) * (b2_z2 - b2_z1)
+#     union = vol1 + vol2 - intersection + eps
+
+#     return intersection / union

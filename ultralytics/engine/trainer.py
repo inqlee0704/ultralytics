@@ -129,8 +129,8 @@ class BaseTrainer:
 
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolov8n -> yolov8n.pt
-        # with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
-            # self.trainset, self.testset = self.get_dataset()
+        with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
+            self.trainset, self.testset = self.get_dataset()
         self.ema = None
 
         # Optimization utils init

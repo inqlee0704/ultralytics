@@ -89,7 +89,8 @@ def on_pretrain_routine_end(trainer):
 
 def on_train_epoch_end(trainer):
     """Log training metrics at the end of each train epoch to MLflow."""
-    if mlflow:
+    if False:
+    # if mlflow:
         mlflow.log_metrics(
             metrics={
                 **sanitize_dict(trainer.lr),

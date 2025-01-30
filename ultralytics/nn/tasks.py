@@ -76,6 +76,7 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
+    v8DetectionLoss3D,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.plotting import feature_visualization
@@ -260,7 +261,7 @@ class BaseModel(nn.Module):
         """
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect
+        if isinstance(m, Detect) or isinstance(m, Detect3D):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect
             m.stride = fn(m.stride)
             m.anchors = fn(m.anchors)
             m.strides = fn(m.strides)
@@ -919,7 +920,7 @@ def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
     model.pt_path = weight  # attach *.pt file path to model
     model.task = guess_model_task(model)
     if not hasattr(model, "stride"):
-        model.stride = torch.tensor([32.0])
+        model.stride = torch.tensor([8, 16, 32])
 
     model = model.fuse().eval() if fuse and hasattr(model, "fuse") else model.eval()  # model in eval mode
 
@@ -1184,39 +1185,151 @@ def guess_model_task(model):
     return "detect"  # assume detect
 
 
-class DetectionModel3D(BaseModel):
-    """YOLOv8 3D detection model."""
-    
-    def __init__(self, cfg='yolo11-3d.yaml', ch=1, nc=None, verbose=True):
-        """Initialize 3D detection model with given config and parameters."""
+class BaseModel3D(BaseModel):
+    """The BaseModel3D class serves as a base class for all the 3D models in the Ultralytics YOLO family."""
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """
+        Perform a forward pass through the network.
+
+        Args:
+            x (torch.Tensor): The input tensor to the model (3D volume).
+            profile (bool):  Print the computation time of each layer if True, defaults to False.
+            visualize (bool): Save the feature maps of the model if True, defaults to False.
+            embed (list, optional): A list of feature vectors/embeddings to return.
+
+        Returns:
+            (torch.Tensor): The last output of the model.
+        """
+        y, dt, embeddings = [], [], []  # outputs
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)  # run
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if embed and m.i in embed:
+                embeddings.append(nn.functional.adaptive_avg_pool3d(x, (1, 1, 1)).squeeze(-1).squeeze(-1).squeeze(-1))  # flatten 3D
+                if m.i == max(embed):
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        return x
+
+    def fuse(self, verbose=True):
+        """
+        Fuse the `Conv3d()` and `BatchNorm3d()` layers of the model into a single layer, in order to improve the
+        computation efficiency.
+
+        Returns:
+            (nn.Module): The fused model is returned.
+        """
+        if not self.is_fused():
+            for m in self.model.modules():
+                if isinstance(m, (Conv3d, DWConv3d)) and hasattr(m, "bn"):
+                    m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
+                    delattr(m, "bn")  # remove batchnorm
+                    m.forward = m.forward_fuse  # update forward
+            self.info(verbose=verbose)
+        return self
+
+    def _apply(self, fn):
+        """
+        Applies a function to all the tensors in the model that are not parameters or registered buffers.
+
+        Args:
+            fn (function): the function to apply to the model
+
+        Returns:
+            (BaseModel3D): An updated BaseModel3D object.
+        """
+        self = super(BaseModel, self)._apply(fn)  # call nn.Module._apply instead of BaseModel._apply
+        m = self.model[-1]  # Detect3D()
+        if isinstance(m, Detect3D):
+            m.stride = fn(m.stride)
+            m.anchors = fn(m.anchors)
+            m.strides = fn(m.strides)
+        return self
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the BaseModel3D."""
+        raise NotImplementedError("compute_loss() needs to be implemented by task heads")
+
+
+class DetectionModel3D(BaseModel3D):
+    def __init__(self, cfg="yolov8n-3d.yaml", ch=3, nc=None, verbose=True):  # model, input channels, number of classes
+        """Initialize the YOLOv8 3D detection model with the given config and parameters."""
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
 
         # Define model
-        ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
-        if nc and nc != self.yaml['nc']:
+        ch = self.yaml["ch"] = self.yaml.get("ch", ch)  # input channels
+        if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
-            self.yaml['nc'] = nc  # override yaml value
-            
+            self.yaml["nc"] = nc  # override YAML value
         self.model, self.save = parse_model_3d(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
-        self.names = {i: f'class{i}' for i in range(self.yaml['nc'])}  # default names dict
-        self.inplace = self.yaml.get('inplace', True)
+        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+        self.inplace = self.yaml.get("inplace", True)
 
-    def forward(self, x):
-        """Forward pass through model."""
-        return self._forward_once(x)
-    
-    def _forward_once(self, x):
-        """Forward pass of detection model."""
-        y, dt = [], []  # outputs
-        for ii, m in enumerate(self.model):
-            # print(ii)
-            if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
-            x = m(x)  # run
-            y.append(x if m.i in self.save else None)  # save output
-        return x
+        # Build strides
+        m = self.model[-1]  # Detect3D()
+        if isinstance(m, Detect3D):
+            s = 256  # 2x min stride
+            m.inplace = self.inplace
+            forward = lambda x: self.forward(x)[0] if isinstance(m, Detect3D) else self.forward(x)
+            m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s, s))])  # forward
+            self.stride = m.stride
+            m.bias_init()  # only run once
 
+        # Init weights, biases
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    def _predict_augment(self, x):
+        """Perform augmentations on input volume x and return augmented inference and train outputs."""
+        if self.__class__.__name__ != "DetectionModel3D":
+            LOGGER.warning("WARNING ⚠️ Model does not support 'augment=True', reverting to single-scale prediction.")
+            return self._predict_once(x)
+        vol_size = x.shape[-3:]  # depth, height, width
+        s = [1, 0.83, 0.67]  # scales
+        f = [None, 3, None]  # flips (2-ud, 3-lr)
+        y = []  # outputs
+        for si, fi in zip(s, f):
+            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
+            yi = super().predict(xi)[0]  # forward
+            yi = self._descale_pred(yi, fi, si, vol_size)
+            y.append(yi)
+        y = self._clip_augmented(y)  # clip augmented tails
+        return torch.cat(y, -1), None  # augmented inference, train
+
+    @staticmethod
+    def _descale_pred(p, flips, scale, vol_size, dim=1):
+        """De-scale predictions following augmented inference (inverse operation)."""
+        p[:, :4] /= scale  # de-scale
+        x, y, z, whl, cls = p.split((1, 1, 1, 3, p.shape[dim] - 6), dim)  # x, y, z, whl(width,height,length), cls
+        if flips == 2:
+            y = vol_size[1] - y  # de-flip ud
+        elif flips == 3:
+            x = vol_size[2] - x  # de-flip lr
+        return torch.cat((x, y, z, whl, cls), dim)
+
+    def _clip_augmented(self, y):
+        """Clip YOLOv8 augmented inference tails."""
+        nl = self.model[-1].nl  # number of detection layers (P3-P5)
+        g = sum(4**x for x in range(nl))  # grid points
+        e = 1  # exclude layer count
+        i = (y[0].shape[-1] // g) * sum(4**x for x in range(e))  # indices
+        y[0] = y[0][..., :-i]  # large
+        i = (y[-1].shape[-1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # indices
+        y[-1] = y[-1][..., i:]  # small
+        return y
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the DetectionModel3D."""
+        return v8DetectionLoss3D(self)  # You may need to create a v8Detection3DLoss class
 
 def parse_model_3d(d, ch, verbose=True):  # model_dict, input_channels(3)
     """Parse a YOLO model.yaml dictionary into a PyTorch model."""

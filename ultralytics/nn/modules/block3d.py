@@ -4,6 +4,40 @@ import torch
 import torch.nn as nn
 from .conv3d import Conv3d
 
+class DFL3d(nn.Module):
+    """
+    3D version of the Integral module of Distribution Focal Loss (DFL).
+    
+    Proposed in Generalized Focal Loss https://ieeexplore.ieee.org/document/9792391
+    Adapted for 3D operations with 6 coordinates (x, y, z, width, height, depth).
+    """
+
+    def __init__(self, c1=16):
+        """Initialize a 3D convolutional layer with a given number of input channels."""
+        super().__init__()
+        self.conv = nn.Conv3d(c1, 1, 1, bias=False).requires_grad_(False)
+        x = torch.arange(c1, dtype=torch.float)
+        self.conv.weight.data[:] = nn.Parameter(x.view(1, c1, 1, 1, 1))
+        self.c1 = c1
+
+    def forward(self, x):
+        """
+        Applies DFL operation on input tensor 'x'.
+        
+        Args:
+            x: Input tensor with shape (batch, channels, anchors)
+               where channels = 6 * c1 for 3D boxes (x, y, z, w, h, d)
+        
+        Returns:
+            Tensor with shape (batch, 6, anchors) containing box coordinates
+        """
+        b, _, a = x.shape  # batch, channels, anchors
+        # Reshape to handle 6 coordinates (x,y,z,w,h,d) instead of 4 (x,y,w,h)
+        x = x.view(b, 6, self.c1, 1, a)
+        x = x.softmax(2).transpose(2, 1)
+        return self.conv(x).view(b, 6, a)
+        # return self.conv(x.view(b, 6, self.c1, a).transpose(2, 1).softmax(1)).view(b, 6, a)
+
 class C3_3d(nn.Module):
     """3D version of CSP Bottleneck with 3 convolutions."""
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
